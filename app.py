@@ -78,7 +78,10 @@ async def init_db():
             username TEXT,
             balance REAL DEFAULT 0,
             total_deposit REAL DEFAULT 0,
-            referrals INTEGER DEFAULT 0
+            referrals INTEGER DEFAULT 0,
+            autobuy_enabled INTEGER DEFAULT 0,
+            autobuy_stars_min INTEGER DEFAULT 0,
+            autobuy_stars_max INTEGER DEFAULT 0
         )""")
         await db.execute("""
         CREATE TABLE IF NOT EXISTS deposits (
@@ -318,19 +321,22 @@ async def deposit_amount(callback: types.CallbackQuery):
             ("Подарок 3", 200, 8),
             # ... и т.д.
         ]
+        message = ""  # ← инициализация message!
         for gift_name, price, stars in sorted(gifts, key=lambda x: x[1]):
             if not (stars_min <= stars <= stars_max):
                 continue
-        while balance >= price:
-            await refund_user(callback.from_user.id, price)
-            await buy_gift(callback.from_user.id, gift_name)
-            balance -= price
-            message += f"\n🎉 Автопокупка: <b>{gift_name}</b> за {price}₽ ({stars} ⭐)"
-
-        await callback.message.answer(
-            message,
-            reply_markup=get_main_menu()
-        )
+            while balance >= price:
+                ok = await refund_user(callback.from_user.id, price)
+                if not ok:
+                    break  # если недостаточно средств, выходим из цикла
+                await buy_gift(callback.from_user.id, gift_name)
+                balance -= price
+                message += f"\n🎉 Автопокупка: <b>{gift_name}</b> за {price}₽ ({stars} ⭐)"
+        if message:  # если были покупки
+            await callback.message.answer(
+                message,
+                reply_markup=get_main_menu()
+            )
         await callback.answer()
 
 @dp.callback_query(F.data == "catalog")
