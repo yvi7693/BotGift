@@ -20,6 +20,55 @@ class AdminStates(StatesGroup):
     waiting_commission_rate = State()
     waiting_broadcast_text = State()
 
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+
+class AutobuyStarsStates(StatesGroup):
+    waiting_for_min = State()
+    waiting_for_max = State()
+
+def get_autobuy_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Включить", callback_data="autobuy_on"),
+         InlineKeyboardButton(text="❌ Выключить", callback_data="autobuy_off")],
+        [InlineKeyboardButton(text="⭐ Установить диапазон звёзд", callback_data="autobuy_set_stars_range")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+    ])
+
+@dp.callback_query(F.data == "autobuy_set_stars_range")
+async def autobuy_set_stars_range(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите МИНИМАЛЬНОЕ количество звёзд для автопокупки:")
+    await state.set_state(AutobuyStarsStates.waiting_for_min)
+    await callback.answer()
+
+@dp.message(AutobuyStarsStates.waiting_for_min)
+async def process_autobuy_min(message: types.Message, state: FSMContext):
+    try:
+        min_stars = int(message.text.strip())
+        await state.update_data(min_stars=min_stars)
+        await message.answer("Введите МАКСИМАЛЬНОЕ количество звёзд для автопокупки:")
+        await state.set_state(AutobuyStarsStates.waiting_for_max)
+    except Exception:
+        await message.answer("Ошибка! Введите только число.")
+
+@dp.message(AutobuyStarsStates.waiting_for_max)
+async def process_autobuy_max(message: types.Message, state: FSMContext):
+    try:
+        max_stars = int(message.text.strip())
+        data = await state.get_data()
+        min_stars = data.get("min_stars", 0)
+        if max_stars < min_stars:
+            await message.answer("Максимальное значение должно быть больше или равно минимальному!")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET autobuy_stars_min=?, autobuy_stars_max=? WHERE user_id=?",
+                             (min_stars, max_stars, message.from_user.id))
+            await db.commit()
+        await message.answer(f"Диапазон звёзд для автопокупки установлен: от {min_stars} до {max_stars} ⭐")
+    except Exception:
+        await message.answer("Ошибка! Введите только число.")
+    await state.clear()
+
 # --- БАЗА ---
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -174,12 +223,7 @@ def get_refund_menu():
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="profile")]
     ])
 
-def get_autobuy_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Включить", callback_data="autobuy_on"),
-         InlineKeyboardButton(text="❌ Выключить", callback_data="autobuy_off")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-    ])
+
 
 def get_gift_back_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -226,13 +270,22 @@ async def profile(callback: types.CallbackQuery):
     balance = info[1]
     total_deposit = info[2]
     referrals = info[3]
+
+    # Новый код:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT autobuy_enabled FROM users WHERE user_id=?", (callback.from_user.id,))
+        autobuy_enabled = (await cursor.fetchone())[0]
+
+    autobuy_status = "Включена" if autobuy_enabled else "Выключена"
+
     await callback.message.answer(
         f"👤 <b>Профиль</b>\n"
         f"Юзер: @{username}\n"
         f"ID: <code>{callback.from_user.id}</code>\n"
         f"Баланс: <b>{balance:.2f}₽</b>\n"
         f"Всего пополнено: <b>{total_deposit:.2f}₽</b>\n"
-        f"Рефералов: <b>{referrals}</b>\n",
+        f"Рефералов: <b>{referrals}</b>\n"
+        f"Автопокупка: <b>{autobuy_status}</b>",
         reply_markup=get_profile_menu()
     )
     await callback.answer()
@@ -250,11 +303,35 @@ async def deposit(callback: types.CallbackQuery):
 async def deposit_amount(callback: types.CallbackQuery):
     amount = 100 if callback.data == "deposit_100" else 500
     await add_deposit(callback.from_user.id, amount)
-    await callback.message.answer(
-        f"✅ Баланс пополнен на <b>{amount}₽</b>!\nТекущий баланс: <b>{await get_balance(callback.from_user.id):.2f}₽</b>",
-        reply_markup=get_main_menu()
-    )
-    await callback.answer()
+
+    # Получаем статус автопокупки и баланс
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT autobuy_enabled, autobuy_stars_min, autobuy_stars_max, balance FROM users WHERE user_id=?",
+            (callback.from_user.id,))
+        autobuy_enabled, stars_min, stars_max, balance = await cursor.fetchone()
+
+    if autobuy_enabled:
+        gifts = [
+            ("Подарок 1", 50, 3),
+            ("Подарок 2", 100, 5),
+            ("Подарок 3", 200, 8),
+            # ... и т.д.
+        ]
+        for gift_name, price, stars in sorted(gifts, key=lambda x: x[1]):
+            if not (stars_min <= stars <= stars_max):
+                continue
+        while balance >= price:
+            await refund_user(callback.from_user.id, price)
+            await buy_gift(callback.from_user.id, gift_name)
+            balance -= price
+            message += f"\n🎉 Автопокупка: <b>{gift_name}</b> за {price}₽ ({stars} ⭐)"
+
+        await callback.message.answer(
+            message,
+            reply_markup=get_main_menu()
+        )
+        await callback.answer()
 
 @dp.callback_query(F.data == "catalog")
 async def catalog(callback: types.CallbackQuery):
@@ -375,11 +452,17 @@ async def autobuy_menu(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "autobuy_on")
 async def autobuy_on(callback: types.CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET autobuy_enabled=1 WHERE user_id=?", (callback.from_user.id,))
+        await db.commit()
     await callback.message.answer("✅ Автопокупка <b>включена</b>!", reply_markup=get_main_menu())
     await callback.answer()
 
 @dp.callback_query(F.data == "autobuy_off")
 async def autobuy_off(callback: types.CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET autobuy_enabled=0 WHERE user_id=?", (callback.from_user.id,))
+        await db.commit()
     await callback.message.answer("❌ Автопокупка <b>выключена</b>!", reply_markup=get_main_menu())
     await callback.answer()
 
